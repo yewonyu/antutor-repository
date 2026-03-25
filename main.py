@@ -2,6 +2,7 @@ import asyncio
 import json
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -24,6 +25,15 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="Antutor Metric AI Backend", description="Sejong University Capstone Backend")
+
+# 이 코드가 있어야 프론트엔드에서 백엔드 데이터를 읽을 수 있음
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], # 리액트 주소
+    allow_credentials=True,
+    allow_methods=["*"], # 모든 방식(GET, POST 등) 허용
+    allow_headers=["*"], # 모든 헤더 허용
+)
 
 # ---------------------------------------------------------
 # 1. AI 모델 초기화 (Model Initialization)
