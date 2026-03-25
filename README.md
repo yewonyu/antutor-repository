@@ -1,3 +1,5 @@
+# Welcome to Antutor!
+
 # Antutor Metric AI Backend
 
 A high-performance, Python-based FastAPI backend for a multi-agent learning support platform (Sejong University capstone project). The system utilizes a novel hybrid evaluation pipeline—an initial **NLI-based Gatekeeper** for contradiction filtering, followed by **LLM Atomic Decomposition** and **Multi-Agent Feedback**—to provide intelligent scoring, personalized scaffolding, and educational insights to learners.
