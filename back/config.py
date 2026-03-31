@@ -74,25 +74,23 @@ CONCEPT_DICTIONARY = {
     }
 }
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-AZURE_PHI4_ENDPOINT = os.getenv("AZURE_PHI4_ENDPOINT", "")
-AZURE_PHI4_API_KEY = os.getenv("AZURE_PHI4_API_KEY", "")
+LOCAL_LLM_ENDPOINT = os.getenv("LOCAL_LLM_ENDPOINT", "http://localhost:11434/api/chat")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "gemma3:12b")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 PROMPTS = {
-    "atomic_extraction": """
-You are an expert at breaking down complex sentences into atomic knowledge units.
-Given the User Answer: "{user_answer}"
-And the Ground Truth: "{ground_truth}"
-1. Extract independent atomic propositions from the user's answer.
-2. Evaluate and score (0.0 to 1.0) based on how accurately the extracted units match the ground truth (Intelligent Scoring).
-Return ONLY valid JSON without markdown tags:
-{{"propositions": ["atomic1", "atomic2"], "score": 0.85}}
-""",
     "experts": {
-        "The Academic Auditor": "You are 'The Academic Auditor'. Evaluate the following concept explanation based on theoretical accuracy and formal economic principles. The NLI-atomic algorithm has scored this answer's knowledge alignment at {nli_score:.2f} out of 1.0. Use this score to inform your brief assessment.\nConcept: {concept}\nUser Answer: {user_answer}\nProvide a brief assessment.",
+        "The Academic Auditor": """You are 'The Academic Auditor'. You act as an impartial evaluator to assess a student's answer against the formal ground truth.
+Concept: {concept}
+Ground Truth: {ground_truth}
+User Answer: {user_answer}
+
+You MUST return a valid JSON object with exactly three keys:
+1. "is_contradiction": boolean (true if the user's answer explicitly contradicts the fundamental meaning of the ground truth, false otherwise)
+2. "score": float from 0.0 to 1.0 representing accuracy.
+3. "feedback": string containing a brief, encouraging assessment.
+
+Return ONLY the JSON object, with no markdown tags (e.g., no ```json).""",
         "The Market Practitioner": "You are 'The Market Practitioner'. Evaluate the concept explanation based on real-world market impacts. Incorporate the following News API RAG context into your assessment.\nNews Context: {context}\nConcept: {concept}\nUser Answer: {user_answer}\nProvide a brief assessment. Finally, on a new line, provide a numerical score from 0.00 to 1.00 enclosed in brackets, e.g., [0.85].",
         "The Macro-Connector": "You are 'The Macro-Connector'. Evaluate how well the explanation connects the concept to broader macroeconomic trends. Incorporate the following Knowledge Graph context into your assessment.\nKnowledge Graph Context: {context}\nConcept: {concept}\nUser Answer: {user_answer}\nProvide a brief assessment. Finally, on a new line, provide a numerical score from 0.00 to 1.00 enclosed in brackets, e.g., [0.85]."
     }

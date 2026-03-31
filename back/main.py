@@ -6,30 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-import numpy as np
-from sentence_transformers import CrossEncoder
 from datetime import datetime, timedelta
 import jwt
 import bcrypt
-from google import genai
 
 # Import definitions and configuration from config.py
 from config import (
-    TARGET_CONCEPTS, CONCEPT_DICTIONARY, AZURE_PHI4_ENDPOINT, AZURE_PHI4_API_KEY, 
+    TARGET_CONCEPTS, CONCEPT_DICTIONARY, LOCAL_LLM_ENDPOINT, LOCAL_LLM_MODEL, 
     PROMPTS, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES,
-    GIVE_UP_KEYWORDS, NEWS_API_KEY, GEMINI_API_KEY, GCP_PROJECT_ID, GCP_LOCATION
+    GIVE_UP_KEYWORDS, NEWS_API_KEY
 )
-
-gemini_client = None
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE":
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-elif GCP_PROJECT_ID:
-    # Vertex AI initialization
-    gemini_client = genai.Client(
-        vertexai=True,
-        project=GCP_PROJECT_ID,
-        location=GCP_LOCATION
-    )
 
 app = FastAPI(title="Antutor Metric AI Backend", description="Sejong University Capstone Backend")
 
@@ -45,12 +31,7 @@ app.add_middleware(
 # ---------------------------------------------------------
 # 1. AI 모델 초기화 (Model Initialization)
 # ---------------------------------------------------------
-print("Loading NLI model. This might take a minute on first run...")
-try:
-    nli_model = CrossEncoder('cross-encoder/nli-deberta-v3-base')
-except Exception as e:
-    print(f"Warning: Failed to load NLI DeBERTa model: {e}")
-    nli_model = None
+# NLI model usage has been removed in favor of a local LLM-as-a-judge.
 
 # In-Memory DBs
 session_memory: Dict[str, Any] = {}
@@ -112,6 +93,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return username
 
+@app.get("/check-username")
+async def check_username(username: str):
+    """지정된 아이디(username)가 이미 데이터베이스에 존재하는지 실시간으로 확인합니다."""
+    if username in users_db:
+        return {"available": False, "message": "Username already exists."}
+    return {"available": True, "message": "Username is available."}
+
 @app.post("/register")
 async def register(user: UserCreate):
     if user.username in users_db:
@@ -143,61 +131,53 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 # 4. 핵심 로직: 하이브리드 게이트키퍼 및 Antutor Metric (Core Logic)
 # ---------------------------------------------------------
 
-async def extract_atomic_propositions(user_answer: str, ground_truth: str) -> List[str]:
-    # 1. API 키가 없으면 예외 발생 (에러 트래킹 목적)
-    if not gemini_client:
-        raise HTTPException(status_code=500, detail="Gemini API Key is not configured for Atomic Extraction.")
-        
-    # 2. 진짜 Gemini API 추출 로직 설계
-    prompt = PROMPTS["atomic_extraction"].format(user_answer=user_answer, ground_truth=ground_truth)
+async def call_local_llm(prompt: str, is_json: bool = False, model: Optional[str] = None) -> str:
+    """Helper to call local LLM API (e.g., Ollama)"""
+    model_name = model or LOCAL_LLM_MODEL
     
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False
+    }
+    
+    if is_json:
+        payload["format"] = "json"
+        
     try:
-        response = await gemini_client.aio.models.generate_content(
-            model='publishers/google/models/gemini-2.5-flash',
-            contents=prompt
-        )
-        raw_text = response.text.strip()
-        
-        # 모델이 마크다운 블록(```json 등)을 반환할 수 있으므로 제거
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
+        async with httpx.AsyncClient() as client:
+            response = await client.post(LOCAL_LLM_ENDPOINT, json=payload, timeout=120.0)
+            response.raise_for_status()
+            data = response.json()
             
-        data = json.loads(raw_text.strip())
-        return data.get("propositions", [user_answer])
+            if "message" in data:
+                return data["message"]["content"]
+            elif "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            return str(data)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini API extraction failed: {str(e)}")
-
-async def verify_nli_contradiction(user_answer: str, ground_truth: str) -> bool:
-    if not nli_model:
-        raise HTTPException(status_code=500, detail="NLI DeBERTa model is not loaded.")
-    pairs = [[ground_truth, user_answer]]
-    scores = await asyncio.to_thread(nli_model.predict, pairs)
-    if np.argmax(scores[0]) == 0:
-        return True
-    return False
-
-async def verify_nli_atomic(propositions: List[str], ground_truth: str) -> float:
-    if not nli_model or not propositions:
-        raise HTTPException(status_code=500, detail="NLI DeBERTa model is not loaded or propositions are empty.")
+        print(f"Local LLM Call Error: {str(e)}")
+        if is_json:
+            return '{"is_contradiction": false, "score": 0.5, "feedback": "API error."}'
     
-    entailment_count: int = 0
-    pairs = [[ground_truth, prop] for prop in propositions]
-    scores = await asyncio.to_thread(nli_model.predict, pairs)
-    
-    for score in scores:
-        if np.argmax(score) == 1:
-            entailment_count += 1
-            
-    return float(entailment_count) / len(propositions)
+    return "Local LLM Error."
 
-async def calculate_antutor_score(user_answer: str, ground_truth: str) -> tuple:
-    propositions = await extract_atomic_propositions(user_answer, ground_truth)
-    score = await verify_nli_atomic(propositions, ground_truth)
-    return propositions, score
+async def evaluate_academic_auditor(concept: str, user_answer: str, ground_truth: str) -> dict:
+    prompt = PROMPTS["experts"]["The Academic Auditor"].format(
+        concept=concept, ground_truth=ground_truth, user_answer=user_answer
+    )
+    
+    raw_response = await call_local_llm(prompt, is_json=True)
+    try:
+        return json.loads(raw_response)
+    except Exception:
+        return {
+            "is_contradiction": False,
+            "score": 0.5,
+            "feedback": "Failed to parse local LLM assessment."
+        }
 
 async def retrieve_news_rag(concept: str) -> str:
     # 1. NEWS_API_KEY가 없는 경우 예외 발생
@@ -226,64 +206,26 @@ async def retrieve_knowledge_graph(concept: str) -> str:
     await asyncio.sleep(0.5)
     return f"Knowledge Graph Node [{concept}] -> Connected to [Global Trade, Employment Rates, Inflation]. Policy changes directly impact these connected nodes."
 
-async def call_expert_agent(persona: str, concept: str, user_answer: str, context: Optional[str] = None, nli_score: Optional[float] = None) -> Dict[str, Any]:
-    if persona == "The Academic Auditor":
-        prompt = PROMPTS["experts"][persona].format(concept=concept, user_answer=user_answer, nli_score=nli_score)
-    else:
-        prompt = PROMPTS["experts"][persona].format(concept=concept, user_answer=user_answer, context=context)
-
-    # Azure OpenAI/MaaS Chat Completions 포맷에 맞춘 페이로드
-    payload = {
-        "model": "Phi-4", # Azure AI Studio의 배포 이름(Deployment Name)과 동일하게 맞춰야 함
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500
-    }
+async def call_expert_agent(persona: str, concept: str, user_answer: str, context: Optional[str] = None) -> Dict[str, Any]:
+    prompt = PROMPTS["experts"][persona].format(concept=concept, user_answer=user_answer, context=context)
     
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AZURE_PHI4_API_KEY}"
-    }
-    
-    # Azure API 호출
-    async with httpx.AsyncClient() as client:
-        try:
-            if not AZURE_PHI4_ENDPOINT or not AZURE_PHI4_API_KEY:
-                raise HTTPException(status_code=500, detail="Azure Phi-4 Endpoint or API Key is missing in .env configuration.")
-
-            response = await client.post(AZURE_PHI4_ENDPOINT, headers=headers, json=payload, timeout=120.0)
-            
-            # API 권한 오류나 기타 상태 에러 발생 시 예외 생성
-            response.raise_for_status()
-            
-            result = response.json()
-            feedback = result["choices"][0]["message"]["content"].strip()
+    try:
+        feedback = await call_local_llm(prompt, is_json=False)
+        score = None
+        import re
+        match = re.search(r'\[\s*(0\.\d+|1\.00?)\s*\]', feedback)
+        if match:
+            try:
+                score = float(match.group(1))
+                feedback = re.sub(r'\[\s*(0\.\d+|1\.00?)\s*\]', '', feedback).strip()
+            except ValueError:
+                pass
                 
-            score = None
-            if persona != "The Academic Auditor":
-                import re
-                match = re.search(r'\[\s*(0\.\d+|1\.00?)\s*\]', feedback)
-                if match:
-                    try:
-                        score = float(match.group(1))
-                        feedback = re.sub(r'\[\s*(0\.\d+|1\.00?)\s*\]', '', feedback).strip()
-                    except ValueError:
-                        pass
-                
-            return {"persona": persona, "feedback": feedback, "score": score}
-        except httpx.ReadTimeout:
-            raise HTTPException(status_code=504, detail=f"[{persona} Timeout] Azure server timed out after 120 seconds.")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=500, detail=f"[{persona} Azure API Error] Status {e.response.status_code}: {e.response.text}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"[{persona} Connection Error] Failed to generate feedback: {str(e)}")
+        return {"persona": persona, "feedback": feedback, "score": score}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"[{persona} Connection Error] Failed to generate feedback: {str(e)}")
 
 async def generate_moderator_guidance_message(user_answer: str, lowest_persona: str, expert_results: List[Dict]) -> str:
-    if not gemini_client:
-        return f"Your answer is a good start, but needs more depth from the perspective of {lowest_persona}. Try to expand on that!"
-        
     lowest_feedback = next((res["feedback"] for res in expert_results if res["persona"] == lowest_persona), "")
     
     prompt = f"""
@@ -296,14 +238,7 @@ Write a short, encouraging message in English (1-3 sentences) directly replying 
 2. End with a follow-up question to help them think about that missing aspect.
 Do NOT give them the direct answer.
 """
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model='publishers/google/models/gemini-2.5-flash',
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        return f"Your answer needs improvement, particularly in the perspective of {lowest_persona}. Please try again considering their feedback!"
+    return await call_local_llm(prompt, is_json=False)
 
 # ---------------------------------------------------------
 # 5. Application API Endpoints
@@ -367,45 +302,44 @@ async def chat(request: ChatRequest, current_user: str = Depends(get_current_use
         expert_results = [{"persona": "System", "score": 0.0, "feedback": "User requested help."}]
         lowest_persona = "System"
     else:
-        # 정답과 완전히 모순되는지 검증
-        is_contradiction = await verify_nli_contradiction(request.user_answer, ground_truth)
+        # LLM-as-a-judge (단일 평가 방식으로 변경)
+        academic_result = await evaluate_academic_auditor(concept, request.user_answer, ground_truth)
+        is_contradiction = academic_result.get("is_contradiction", False)
+        antutor_score = academic_result.get("score", 0.0)
+        
         if is_contradiction:
             # 모순이 발생하면 오답 처리 및 점수 0점 부여
             antutor_score = 0.0
-            propositions = ["NLI Blocked: Explicit contradiction found."]
+            propositions = ["Local LLM Blocked: Explicit contradiction found."]
             expert_results = [{"persona": "System", "score": 0.0, "feedback": "Answer contradicts the ground truth."}]
             expert_scores = {"System": 0.0, "The Market Practitioner": 0.0, "The Macro-Connector": 0.0, "The Academic Auditor": 0.0}
         else:
-            # 2 & 3. Atomic-NLI(명제 추출 및 정렬 점수 산출) 평가와 외부 컨텍스트(뉴스, 지식 그래프) 병렬 수집
-            (propositions, antutor_score), news_context, kg_context = await asyncio.gather(
-                calculate_antutor_score(request.user_answer, ground_truth),
+            propositions = ["(Atomic extraction skipped: Evaluated by LLM-as-a-judge in one go)"]
+            
+            # 외부 컨텍스트 병렬 수집 (News, KG)
+            news_context, kg_context = await asyncio.gather(
                 retrieve_news_rag(concept),
                 retrieve_knowledge_graph(concept)
             )
 
-            # 4. 세 명의 전문가 에이전트 지정 (Academic -> Market -> Macro 순서)
-            personas = ["The Academic Auditor", "The Market Practitioner", "The Macro-Connector"]
-            # 5. 수집된 컨텍스트와 Antutor 스코어를 넣어 각각의 에이전트들에게 비동기로 피드백 생성을 요청
-            # Market과 Macro는 자체적으로 프롬프트를 통해 점수 생성
+            # 나머지 두 전문가 (Market, Macro) 에이전트 평가 병렬 요청
             tasks = [
-                call_expert_agent("The Academic Auditor", concept, request.user_answer, nli_score=antutor_score),
                 call_expert_agent("The Market Practitioner", concept, request.user_answer, context=news_context),
                 call_expert_agent("The Macro-Connector", concept, request.user_answer, context=kg_context)
             ]
             
-            # 병렬로 던진 모든 에이전트의 피드백이 완성될 때까지 대기
-            expert_results = list(await asyncio.gather(*tasks))
+            other_expert_results = list(await asyncio.gather(*tasks))
 
-            # 6. 각 전문가별 점수 할당 로직
-            # Academic Auditor는 NLI-atomic 알고리즘으로 계산된 antutor_score를 그대로 사용
+            # 합산 결과 리스트 구성
+            expert_results = [
+                {"persona": "The Academic Auditor", "score": antutor_score, "feedback": academic_result.get("feedback", "")}
+            ] + other_expert_results
+
+            # 각 전문가별 점수 할당 로직
             expert_scores_raw = {"The Academic Auditor": antutor_score}
-            for res in expert_results:
-                if res["persona"] == "The Academic Auditor":
-                    res["score"] = antutor_score
-                else:
-                    # 에이전트가 문자열 내에서 추출한 점수를 사용. 파싱 실패 시 기본값 0.75
-                    res["score"] = res.get("score") if res.get("score") is not None else 0.75
-                    expert_scores_raw[res["persona"]] = res["score"]
+            for res in other_expert_results:
+                res["score"] = res.get("score") if res.get("score") is not None else 0.75
+                expert_scores_raw[res["persona"]] = res["score"]
                     
             expert_scores = expert_scores_raw
             
